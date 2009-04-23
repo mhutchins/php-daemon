@@ -33,7 +33,7 @@
 	set_time_limit(0);
 	ob_implicit_flush();
 
-	$pid_file = $args['pidfile'] !="" ? $args['pidfile'] :  "/tmp/$myname.pid";
+	$pid_file = $args['pidfile'] !="" ? $args['pidfile'] : "/tmp/$myname.pid";
 	$priv_user = $args['user'] !="" ? $args['user'] : 'nobody';
 	$priv_group = $args['group'] !="" ? $args['group'] : 'nobody';
 	$port = $args['port'] > 0 ? $args['port'] : 16666;
@@ -178,9 +178,8 @@ function handle_child($sock)
 
 	$db = new PDO('mysql:host=192.168.2.100;dbname=nds', 'nds');
 
-        socket_getpeername($sock, $address);
+	socket_getpeername($sock, $address);
     syslog(LOG_ERR, "Child ".posix_getpid()." servicing client $address.");
-
     while (1) {
         syslog(LOG_INFO, "Child ".posix_getpid()." awaiting data.");
 	$bytes = @socket_recv($sock, $buffer, 16 * 1024, 0);
@@ -199,32 +198,56 @@ function handle_child($sock)
 	    syslog(LOG_INFO, "Child ".posix_getpid()." Arg2: " . $cmd[2] );
 	    syslog(LOG_INFO, "Child ".posix_getpid()." Arg3: " . $cmd[3] );
 	    syslog(LOG_INFO, "Child ".posix_getpid()." Arg4: " . $cmd[4] );
-		if ($cmd[0] == "getusers")
+		if ($cmd[0] == "serial")
 		{
-			$output=GetUserList($db);
+			$array['itema']="dataitema";
+			$array[]=12345;
+			$array[]="dataitem3";
+			$output = json_encode($array);
+			$header=sprintf("% 10s", strlen($output));
+			$output=$header . $output;
 			socket_write($sock, $output, strlen($output));
-			    syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+			syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
 		}
-		if ($cmd[0] == "getcards")
+		if ($cmd[0] == "getlist")
 		{
-			$user=$cmd[1];
-			$output=GetCardList($db, $user);
-			socket_write($sock, $output, strlen($output));
-			    syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+			switch ($cmd[1])
+			{
+				case "users":
+					$arg=$cmd[2];
+					$output=GetUserList($db, $arg);
+					break;
+				case "cards";
+					$user=$cmd[2];
+					$output=GetCardList($db, $user);
+					break;
+				case "roms":
+					$user=$cmd[2];
+					$output=GetRomList($db, $user);
+					break;
+				}
+				$header=sprintf("% 10s", strlen($output));
+				$output=$header . $output;
+				socket_write($sock, $output, strlen($output));
+				syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
 		}
-		if ($cmd[0] == "getroms")
+		if ($cmd[0] == "getitem")
 		{
-			$card=$cmd[1];
-			$output=GetRomList($db, $card);
-			socket_write($sock, $output, strlen($output));
-			    syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+			switch ($cmd[1])
+			{
+				case "rom":
+					$romid=$cmd[2];
+					FetchRom($db, $romid, $sock);
+					break;
+				case "cover":
+				case "unknown":
+				case "ingame":
+				case "info":
+				case "icon":
+					FetchItem($db, $cmd[1], $cmd[2], $sock);
+					break;
+			}
 		}
-		if ($cmd[0] == "fetchnds")
-		{
-			$romid=$cmd[1];
-			FetchRom($db, $romid, $sock);
-		}
-	    //decode($buffer);
 	}
     }
 
@@ -328,35 +351,29 @@ function arguments($argv) {
 
 function GetUserList($db)
 {
-	$list="";
+	$users=array();
         $query="select id, name from user ";
         foreach($db->query($query) as $row)
-                $list .= $row['id'] . '|' . $row['name'] . ',';
-	$list = rtrim($list, ',');
-	if ($list == "") $list = "error";
-	return $list;
+                $users[$row['id']] = $row['name'] ;
+	return json_encode($users);
 }
 
 function GetCardList($db, $user)
 {
-	$list="";
+	$cards=array();
         $query="select id, name from card where userid = $user";
         foreach($db->query($query) as $row)
-                $list .= $row['id'] . '|' . $row['name'] . ',';
-	$list = rtrim($list, ',');
-	if ($list == "") $list = "error";
-	return $list;
+                $cards[$row['id']]= $row['name'];
+	return json_encode($cards);
 }
 
 function GetRomList($db, $card)
 {
-	$list="";
+	$roms=array();
         $query="select a.romid romid, urldecode(a.title) title from card_rom cr, adv a  where cr.cardid = $card and a.romid = cr.romid";
         foreach($db->query($query) as $row)
-                $list .= $row['romid'] . '|' . base64_encode($row['title']) . ',';
-	$list = rtrim($list, ',');
-	if ($list == "") $list = "error";
-	return $list;
+                $roms[$row['romid']] = $row['title'] ;
+	return json_encode($roms);
 }
 
 function FetchRom($db, $romid, $sock)
@@ -369,31 +386,60 @@ function FetchRom($db, $romid, $sock)
 	{
 		if ($compress == 0)
 		{
-			$output= sprintf("% 10s% 8s", $res['len'], $res['sum']);
-			syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
-			socket_write($sock, $output, strlen($output));
-			socket_write($sock, $res['data'], $res['len']);
+			$data = $res['data'];
+			syslog(LOG_INFO, "Child ".posix_getpid()." Compress: from " . $res['len'] . " bytes to " . strlen($data) . " bytes.");
 		}
 		else
 		{
 			syslog(LOG_INFO, "Child ".posix_getpid()." Compressing...");
-			$cdata = gzcompress($res['data'], 1);
-			$clen = strlen($cdata);
-			syslog(LOG_INFO, "Child ".posix_getpid()." Compress: from " . $res['len'] . " bytes to $clen bytes.");
-
-			$output= sprintf("% 10s% 8s", $clen, $res['sum']);
-			syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
-			socket_write($sock, $output, strlen($output));
-
-			socket_write($sock, $cdata, $clen);
+			$data = gzcompress($res['data'], 1);
 		}
 	}
 	else
 	{
-		$output= "error";
-		socket_write($sock, $output, strlen($output));
-		        syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+		$data= "error";
+		$sum= "error";
+		syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$data]");
 	}
+
+	$len = strlen($data);
+	$output= sprintf("% 10s% 8s", $len, $res['sum']);
+	syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+	socket_write($sock, $output, strlen($output));
+	socket_write($sock, $data, $len);
+}
+
+function FetchItem($db, $type, $romid, $sock)
+{
+	$compress=1;
+	$list="";
+        $query="select length(data) len, data from blobdata where type='$type' and id = $romid";
+        $res = $db->query($query)->fetch();
+	if ( $res != null)
+	{
+		if ($compress == 0)
+		{
+			$data = $res['data'];
+			syslog(LOG_INFO, "Child ".posix_getpid()." Compress: from " . $res['len'] . " bytes to " . strlen($data) . " bytes.");
+		}
+		else
+		{
+			syslog(LOG_INFO, "Child ".posix_getpid()." Compressing...");
+			$data = gzcompress($res['data'], 1);
+		}
+	}
+	else
+	{
+		$data= "error";
+		$sum= "error";
+		syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$data]");
+	}
+
+	$len = strlen($data);
+	$output= sprintf("% 10s", $len);
+	syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+	socket_write($sock, $output, strlen($output));
+	socket_write($sock, $data, $len);
 }
 
 ?>
