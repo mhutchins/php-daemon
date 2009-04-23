@@ -1,0 +1,399 @@
+#!/usr/local/bin/php -q
+<?PHP
+///////////////////////////////////////////////////////////////////////////////
+// Code History
+//
+// April 2008	M. Hutchins	Initial POC code.
+// 1 May 2008	M. Hutchins	Code cleanup. First 'production' readiness test.
+// 7 May 2008	M. Hutchins	More code cleanup! (cosmetic).
+// 12 May 2008	M. Hutchins	Parameters support for SMF control.
+// 13 May 2008	M. Hutchins	Decode re-write.
+//
+///////////////////////////////////////////////////////////////////////////////
+//
+	$myname=$_SERVER['argv'][0];
+
+	$args = arguments($_SERVER['argv']);
+	if ($args === false)
+	{
+		echo "Usage: \n\t" . $_SERVER['argv'][0] . " {--port=port} {--pidfile=pidfile} {--user=nobody}\n\t\t{--group=nobody} {--bind=127.0.0.1 --log-facility=LOG_LOCAL0 --log-program=pvt\n\n";
+		echo "Defaults:
+			port=16666
+			pidfile=/tmp/php_socket_daemon.pid
+			user=nobody
+			group=nobody
+			log-facility=LOCAL0
+			log-program=pvt
+			bind=0 (meaning '*')\n";
+		exit(1);
+	}
+
+	define_syslog_variables();
+	declare(ticks = 1);
+	set_time_limit(0);
+	ob_implicit_flush();
+
+	$pid_file = $args['pidfile'] !="" ? $args['pidfile'] :  "/tmp/$myname.pid";
+	$priv_user = $args['user'] !="" ? $args['user'] : 'nobody';
+	$priv_group = $args['group'] !="" ? $args['group'] : 'nobody';
+	$port = $args['port'] > 0 ? $args['port'] : 16666;
+	$address = $args['bind'] > 0 ? $args['bind'] : 0;
+	$log_facility = $args['log-facility'] !="" ? $args['log-facility'] : 'LOCAL0';
+	$log_program = $args['log-program'] !="" ? $args['log-program'] : 'phpserver';
+
+	//error_reporting(E_PARSE);	// We dont want anything from stderr unless its a coding bug
+
+	openlog($log_program, LOG_PID, constant(strtoupper("LOG_" . $log_facility)));
+
+	syslog(LOG_INFO, "Service starting");
+
+	// Become un-privileged
+	setUidGid($priv_user, $priv_group);
+
+	// Assign signal handlers
+	pcntl_signal(SIGHUP, "sig_handler");
+	pcntl_signal(SIGUSR1, "sig_handler");
+	pcntl_signal(SIGCHLD, "sig_handler");
+	pcntl_signal(SIGTERM, "sig_handler");
+	pcntl_signal(SIGINT, "sig_handler");
+
+	if (($sock = socket_create(AF_INET, SOCK_STREAM, 0)) < 0) {
+	    syslog(LOG_CRIT,
+		   "socket_create() failed: reason: ".
+		   socket_strerror(socket_last_error($sock)));
+	    exit;
+	}
+
+	if (!socket_set_option($sock, SOL_SOCKET, SO_REUSEADDR, 1)) {
+		syslog(LOG_CRIT,
+			'Unable to set option on socket: '. socket_strerror(socket_last_error($sock)));
+		exit;
+	}
+
+
+	if (($ret = socket_bind($sock, $address, $port)) <= 0) {
+	    syslog(LOG_CRIT,
+		   "socket_bind() failed: reason: ".
+		   socket_strerror(socket_last_error($sock)));
+	    exit;
+	}
+
+	if (($ret = socket_listen($sock, 0)) < 0) {
+	    syslog(LOG_CRIT,
+		   "socket_listen() failed: reason: ".
+		   socket_strerror(socket_last_error($sock)));
+	    exit;
+	}
+
+
+
+        $fh = open_pid_file($pid_file);
+        syslog(LOG_INFO, "Becoming Daemon....");
+        $pid = daemonize();
+        fputs($fh, $pid);
+        fclose($fh);
+
+	syslog(LOG_INFO, "Server ready. Waiting for connections on port $port......");
+
+	$quit=0;
+	while (!$quit) {
+
+	    $null = NULL;
+	    if (@socket_select($rarray = array($sock), $null, $null, $null) <= 0) {
+		usleep(5000);
+		continue;
+	    }
+
+	    if (($connection = socket_accept($sock)) < 0) {
+		next;
+	    }
+
+	    $child = pcntl_fork();
+
+	    if ($child == -1) {
+		syslog(LOG_CRIT, "Could not fork.. Dying...");
+		$quit++;
+	    }
+
+	    if ($child == 0) {		// We are the child
+		socket_close($sock);
+		syslog(LOG_INFO, "Child ".posix_getpid()." going up.");
+		handle_child($connection);
+		exit;
+	    }
+
+	    socket_close($connection);
+	}
+
+	syslog(LOG_INFO, "Service quitting");
+	if (posix_getpid() == $pid) {
+	    unlink($pid_file);
+	}
+
+	closelog();
+// All done!
+
+
+// Function delcarations
+//
+function sig_handler($signo)
+{
+    global $quit;
+
+
+    switch ($signo) {
+
+    case SIGHUP:
+	syslog(LOG_INFO, "received SIGHUP");
+	
+	// handle restart tasks
+	break;
+
+    case SIGUSR1:
+	syslog(LOG_INFO, "received SIGUSR1");
+	break;
+
+    case SIGCHLD:
+	syslog(LOG_INFO, "received SIGCHILD");
+	$status = 0;
+	$child = pcntl_wait($status, WNOHANG);
+	syslog(LOG_INFO, "Child $child died");
+	break;
+
+	// handle shutdown tasks
+    case SIGTERM:
+	syslog(LOG_INFO, "received SIGTERM");
+    case SIGINT:
+	syslog(LOG_INFO, "received SIGINT");
+	$quit++;
+	break;
+    default:
+	syslog(LOG_ERR, "received unhandled signal: $signo");
+	break;
+    }
+}
+
+function handle_child($sock)
+{
+
+	$db = new PDO('mysql:host=192.168.2.100;dbname=nds', 'nds');
+
+        socket_getpeername($sock, $address);
+    syslog(LOG_ERR, "Child ".posix_getpid()." servicing client $address.");
+
+    while (1) {
+        syslog(LOG_INFO, "Child ".posix_getpid()." awaiting data.");
+	$bytes = @socket_recv($sock, $buffer, 16 * 1024, 0);
+	if ($bytes <= 0) {
+	    syslog(LOG_ERR, "Child ".posix_getpid()." receive error. Closing socket.");
+	    @socket_shutdown($sock, 2);
+	    @socket_close($sock);
+	    break;
+	} else {
+	    syslog(LOG_INFO,
+		   "Child ".posix_getpid()." received $bytes bytes [".
+		   rawurlencode($buffer)."]");
+		$cmd = explode(',', $buffer, 4);
+	    syslog(LOG_INFO, "Child ".posix_getpid()." Cmd: " . $cmd[0] );
+	    syslog(LOG_INFO, "Child ".posix_getpid()." Arg1: " . $cmd[1] );
+	    syslog(LOG_INFO, "Child ".posix_getpid()." Arg2: " . $cmd[2] );
+	    syslog(LOG_INFO, "Child ".posix_getpid()." Arg3: " . $cmd[3] );
+	    syslog(LOG_INFO, "Child ".posix_getpid()." Arg4: " . $cmd[4] );
+		if ($cmd[0] == "getusers")
+		{
+			$output=GetUserList($db);
+			socket_write($sock, $output, strlen($output));
+			    syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+		}
+		if ($cmd[0] == "getcards")
+		{
+			$user=$cmd[1];
+			$output=GetCardList($db, $user);
+			socket_write($sock, $output, strlen($output));
+			    syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+		}
+		if ($cmd[0] == "getroms")
+		{
+			$card=$cmd[1];
+			$output=GetRomList($db, $card);
+			socket_write($sock, $output, strlen($output));
+			    syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+		}
+		if ($cmd[0] == "fetchnds")
+		{
+			$romid=$cmd[1];
+			FetchRom($db, $romid, $sock);
+		}
+	    //decode($buffer);
+	}
+    }
+
+    syslog(LOG_INFO, "Child ".posix_getpid()." terminating.");
+}
+
+function daemonize()
+{
+
+    $child = pcntl_fork();
+    if ($child) {
+        syslog(LOG_INFO, "Handing over to child " . $child . ". Terminating self.");
+	exit;			// kill parent
+    }
+    // We are now the detached child
+    chdir("/");
+    posix_setsid();		// become session leader
+    umask(0);
+    return posix_getpid();
+
+}
+
+function open_pid_file($file)
+{
+
+    if (file_exists($file)) {
+	$fp = fopen($file, "r");
+	$pid = fgets($fp, 1024);
+	fclose($fp);
+	if ($pid > 0) {
+	    if (posix_kill($pid, 0)) {
+		syslog(LOG_CRIT,
+		       "Server Server already running with PID: $pid");
+		print "Server already running with PID: $pid\n";
+		exit;
+	    }
+	}
+	syslog(LOG_INFO,
+	       "Removing PID file for defunct server process $pid");
+	print "Removing PID file for defunct server process $pid\n";
+	if (!unlink($file)) {
+	    syslog(LOG_CRIT, "Cannot unlink PID file $file");
+	    print "Cannot unlink PID file $file\n";
+	    exit;
+	}
+    }
+
+    if ($fp = fopen($file, "w")) {
+	return $fp;
+    } else {
+	syslog(LOG_CRIT, "Unable to open PID file $file for writing...");
+	print "Unable to open PID file $file for writing...\n";
+	exit;
+    }
+}
+
+function setUidGid($user, $group)
+{
+	$arr = posix_getgrnam($group);
+	$gid = $arr['gid'];
+	if (!posix_setgid($gid)) {
+	    syslog(LOG_CRIT, "Unable to setgid to $gid!");
+	    exit;
+	}
+
+	$arr = posix_getpwnam($user);
+	$uid = $arr['uid'];
+	if (!posix_setuid($uid)) {
+	    syslog(LOG_CRIT, "Unable to setuid to $uid!");
+	    exit;
+	}
+}
+
+// TODO: This is *very* sloppy. (but i stole it anyway!) Needs toghtening up to handle
+// a list of expected arguments, check mandatory ones and complain about unknown ones etc...
+// One day....
+//
+function arguments($argv) {
+    $_ARG = array();
+	$first=1;
+	$err = 0;
+    foreach ($argv as $a => $arg) {
+	if ($a == 0) continue;
+      if (ereg('--([^=]+)=(.*)',$arg,$reg)) {
+        $_ARG[$reg[1]] = $reg[2];
+      } elseif(ereg('-([a-zA-Z0-9])',$arg,$reg)) {
+            $_ARG[$reg[1]] = 'true';
+        }
+	else
+	{
+		echo "Bad arg: $arg\n";
+		$err++;
+	}
+   
+    }
+	if ($err > 0)
+		return false;
+	else
+	  return $_ARG;
+}
+
+function GetUserList($db)
+{
+	$list="";
+        $query="select id, name from user ";
+        foreach($db->query($query) as $row)
+                $list .= $row['id'] . '|' . $row['name'] . ',';
+	$list = rtrim($list, ',');
+	if ($list == "") $list = "error";
+	return $list;
+}
+
+function GetCardList($db, $user)
+{
+	$list="";
+        $query="select id, name from card where userid = $user";
+        foreach($db->query($query) as $row)
+                $list .= $row['id'] . '|' . $row['name'] . ',';
+	$list = rtrim($list, ',');
+	if ($list == "") $list = "error";
+	return $list;
+}
+
+function GetRomList($db, $card)
+{
+	$list="";
+        $query="select a.romid romid, urldecode(a.title) title from card_rom cr, adv a  where cr.cardid = $card and a.romid = cr.romid";
+        foreach($db->query($query) as $row)
+                $list .= $row['romid'] . '|' . base64_encode($row['title']) . ',';
+	$list = rtrim($list, ',');
+	if ($list == "") $list = "error";
+	return $list;
+}
+
+function FetchRom($db, $romid, $sock)
+{
+	$compress=1;
+	$list="";
+        $query="select length(data) len, sum, data from blobdata where type='rom' and id = $romid";
+        $res = $db->query($query)->fetch();
+	if ( $res != null)
+	{
+		if ($compress == 0)
+		{
+			$output= sprintf("% 10s% 8s", $res['len'], $res['sum']);
+			syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+			socket_write($sock, $output, strlen($output));
+			socket_write($sock, $res['data'], $res['len']);
+		}
+		else
+		{
+			syslog(LOG_INFO, "Child ".posix_getpid()." Compressing...");
+			$cdata = gzcompress($res['data'], 1);
+			$clen = strlen($cdata);
+			syslog(LOG_INFO, "Child ".posix_getpid()." Compress: from " . $res['len'] . " bytes to $clen bytes.");
+
+			$output= sprintf("% 10s% 8s", $clen, $res['sum']);
+			syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+			socket_write($sock, $output, strlen($output));
+
+			socket_write($sock, $cdata, $clen);
+		}
+	}
+	else
+	{
+		$output= "error";
+		socket_write($sock, $output, strlen($output));
+		        syslog(LOG_INFO, "Child ".posix_getpid()." sending back. [$output]");
+	}
+}
+
+?>
