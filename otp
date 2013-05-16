@@ -298,9 +298,9 @@ function setUidGid($user, $group)
 	}
 }
 
-// TODO: This is *very* sloppy. (but i stole it anyway!) Needs toghtening up to handle
+// TODO: This is *very* sloppy. Needs tightening up to handle
 // a list of expected arguments, check mandatory ones and complain about unknown ones etc...
-// One day....
+// but I am in a hurry, so this will suffice for now.. One day though...
 //
 function arguments($argv) {
     $_ARG = array();
